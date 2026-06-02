@@ -1,0 +1,52 @@
+// Variable-based substring expansion detection (actor-agnostic)
+// Targets the mandatory cmd.exe syntax: set / = / % / : / ~ / , / %
+// Any threat actor using this obfuscation MUST produce this pattern
+
+DeviceProcessEvents
+| where Timestamp > ago(1h)
+| where FileName =~ "cmd.exe" or InitiatingProcessFileName =~ "cmd.exe"
+//
+// === MANDATORY SIGNATURE CHECK ===
+// The %varname:~N,M% syntax — cannot be avoided in this technique
+| extend HasSubstringSyntax = ProcessCommandLine matches regex @"%[A-Za-z_][A-Za-z0-9_]*:~-?\d+(,\d+)?%"
+//
+// === MANDATORY KEYWORD CHECK ===
+// Variable creation requires "set" and "=" together
+| extend HasSetAssignment = ProcessCommandLine matches regex @"(?i)\bset\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*\S{15,}"
+//
+// === MANDATORY CHARACTER FREQUENCY ===
+// Real obfuscation chains many references — count the signature characters
+| extend PercentCount = countof(ProcessCommandLine, "%")
+| extend TildeCount = countof(ProcessCommandLine, "~")
+| extend ColonTildeCount = countof(ProcessCommandLine, ":~")
+//
+// === FILTER ===
+// Require ALL mandatory elements + enough repetition to indicate obfuscation
+| where HasSubstringSyntax
+| where HasSetAssignment
+| where ColonTildeCount >= 5
+| where PercentCount >= 10
+//
+// === SCORING (optional, helps prioritize) ===
+| extend SeverityScore = case(
+    ColonTildeCount >= 50, "Critical",
+    ColonTildeCount >= 20, "High",
+    ColonTildeCount >= 10, "Medium",
+    "Low"
+  )
+//
+// === OUTPUT ===
+| project
+    Timestamp,
+    SeverityScore,
+    DeviceName,
+    AccountName,
+    ColonTildeCount,
+    PercentCount,
+    FileName,
+    ProcessCommandLine,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    InitiatingProcessParentFileName,
+    FolderPath
+| order by ColonTildeCount desc
