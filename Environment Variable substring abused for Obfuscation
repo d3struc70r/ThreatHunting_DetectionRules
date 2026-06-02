@@ -1,6 +1,7 @@
 // Variable-based substring expansion detection (actor-agnostic)
 // Targets the mandatory cmd.exe syntax: set / = / % / : / ~ / , / %
 // Any threat actor using this obfuscation MUST produce this pattern
+// Refer: https://www.genians.co.kr/en/blog/threat_intelligence/python?hsCtaAttrib=343278473915
 
 DeviceProcessEvents
 | where Timestamp > ago(1h)
