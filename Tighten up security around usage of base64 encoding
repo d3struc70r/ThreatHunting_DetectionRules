@@ -1,0 +1,40 @@
+//Rule Description: Detects PowerShell processes (powershell.exe / pwsh.exe) executing commands that use Base64 encoding or encoded command flags. These techniques are commonly used by attackers and malware to obfuscate malicious payloads, evade signature-based detection, and bypass command-line logging. The rule excludes known legitimate parent processes such as development tools, patch management agents, and managed desktop services to reduce false positives.
+//Note: Just like line number 21, 22, 23, 24.. you can exclude the known processess, file name or account name as part of fine tuning and reduce the noice and monitor only those which are rare and uncommon with in the environment.
+
+
+DeviceProcessEvents
+| where Timestamp > ago(1h)
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+    or InitiatingProcessFileName in~ ("powershell.exe", "pwsh.exe")
+| where ProcessCommandLine has_any (
+    "-EncodedCommand",
+    "-enc ",
+    "-ec ",
+    "-e ",
+    "FromBase64String",
+    "[Convert]::FromBase64String",
+    "[System.Convert]::FromBase64String",
+    "ToBase64String",
+    "-EncodedArguments",
+    "encodedcommand"
+)
+| where InitiatingProcessFileName !has "gc_worker.exe"
+| where InitiatingProcessFileName !has "microsoft.management.services.cloudmanageddesktop.agent.exe"
+| where FileName !has "node.exe"
+| where FileName !has "git.exe"
+| where FileName !has "pip.exe"
+| extend DecodedCommand = base64_decode_tostring(
+    extract(@"(?i)-(?:enc|e|ec|encodedcommand)\s+([A-Za-z0-9+/=]+)", 1, ProcessCommandLine)
+)
+| project
+    Timestamp,
+    DeviceName,
+    AccountName,
+    FileName,
+    ProcessCommandLine,
+    DecodedCommand,
+    InitiatingProcessFileName,
+    InitiatingProcessCommandLine,
+    SHA256,
+    FolderPath
+| sort by Timestamp desc
