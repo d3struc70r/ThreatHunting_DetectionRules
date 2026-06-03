@@ -1,0 +1,33 @@
+//This query detects any PowerShell command line containing 10 or more hexadecimal values in the format 0x__ (such as 0x4a, 0x3f, 0x72). The presence of 10 or more 0x values in a single command is a strong indication that a hex-encoded byte array is being constructed inline — which is the core building block of XOR-based payload decryption in PowerShell.
+//This query can is ready to deploy as detection rule on MDE
+
+DeviceProcessEvents
+| where Timestamp > ago(1h)
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+| extend HexCount = countof(ProcessCommandLine, "0x")
+| where HexCount >= 10
+// Plus at least one execution indicator
+| where ProcessCommandLine has_any (
+    "IEX", 
+    "Invoke-Expression", 
+    "bxor",
+    "Reflection.Assembly",
+    "AllocHGlobal",
+    "[byte[]]",
+    "FromBase64String"
+)
+| project 
+    Timestamp,
+    DeviceName,
+    DeviceId,                       
+    AccountName,
+    AccountSid,                     
+    AccountObjectId,                
+    InitiatingProcessFileName,
+    InitiatingProcessSHA256,        
+    ProcessCommandLine,
+    FileName,                     
+    SHA256,                         
+    FolderPath,                      
+    HexCount
+| order by HexCount desc, Timestamp desc
