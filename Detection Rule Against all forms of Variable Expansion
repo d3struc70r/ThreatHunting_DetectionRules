@@ -1,0 +1,28 @@
+//This query/rule is designed to counter the misuse of Command Prompt variable expansion as an obfuscation technique, which threat actors often seen employing in ClickFix attacks. Variable expansion in CMD has four forms: immediate expansion, delayed expansion, substring extraction, and substring replacement. I have recently observed these being leveraged in various attack chains to bypass detection. Addressing this capability was necessary, as it allowed adversaries to evade EDR (Endpoint Detection and Response) systems, making their malicious activity harder to identify.
+
+
+DeviceProcessEvents
+| where InitiatingProcessFileName =~ "explorer.exe"
+| where ProcessCommandLine has "conhost" and ProcessCommandLine has "--headless"
+| where ProcessCommandLine has_any ("%", "!")
+| where ProcessCommandLine has_any ("://", @"\\", "/")
+| extend Cmd = tolower(ProcessCommandLine)
+| extend
+    Conhost = FileName =~ "conhost.exe"
+        or ProcessVersionInfoOriginalFileName =~ "CONHOST.EXE"
+        or Cmd has "conhost",
+    Headless = Cmd has "--headless",
+    HasUrl = Cmd matches regex @'[a-z][a-z0-9+.\-]*://'
+        or Cmd matches regex @'\\\\[a-z0-9_\-][^\\\s]*'
+        or Cmd matches regex @'[a-z0-9\-]+(\.[a-z0-9\-]+)*\.[a-z]{2,}/',
+    ImmFull = Cmd matches regex @'%[^%:]+%',
+    DelFull = Cmd matches regex @'![^!:]+!',
+    SubstrExtract = Cmd matches regex @'[%!][^%!]+:~[^%!]*[%!]',
+    SubstrReplace = Cmd matches regex @'[%!][^%!]+:[^~%!=]+=[^%!]*[%!]'
+| extend AnyExpansion = ImmFull or DelFull or SubstrExtract or SubstrReplace
+| where Conhost and Headless and HasUrl and AnyExpansion
+| extend ExpansionForms = strcat(
+    iff(ImmFull, "Immediate(%var%);", ""), iff(DelFull, "Delayed(!var!);", ""),
+    iff(SubstrExtract, "SubstrExtract(:~);", ""), iff(SubstrReplace, "SubstrReplace(:=);", ""))
+| project Timestamp, ReportId, DeviceId, DeviceName, AccountName, FileName, ExpansionForms,
+          ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine
