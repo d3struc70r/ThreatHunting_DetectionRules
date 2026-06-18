@@ -2,27 +2,58 @@
 
 
 DeviceProcessEvents
-| where InitiatingProcessFileName =~ "explorer.exe"
-| where ProcessCommandLine has "conhost" and ProcessCommandLine has "--headless"
-| where ProcessCommandLine has_any ("%", "!")
-| where ProcessCommandLine has_any ("://", @"\\", "/")
-| extend Cmd = tolower(ProcessCommandLine)
+| where InitiatingProcessFileName in~ (
+    "explorer.exe", "cmd.exe", "powershell.exe",
+    "chrome.exe", "msedge.exe", "firefox.exe",
+    "winword.exe", "excel.exe"
+)
+| extend Cmd = replace_string(tolower(ProcessCommandLine), "^", "")
+| where Cmd contains "%" or Cmd contains "!"
+| where Cmd contains "://" or Cmd contains @"\\" or Cmd contains "/"
+// URL detection
+| extend HasUrl = 
+    Cmd matches regex @'[a-z][a-z0-9+.\-]*://'
+    or Cmd matches regex @'\\\\[a-z0-9_\-][^\\\s]*'
+    or Cmd matches regex @'[a-z0-9\-]+(\.[a-z0-9\-]+)*\.[a-z]{2,}/'
+// Expansion forms
 | extend
-    Conhost = FileName =~ "conhost.exe"
-        or ProcessVersionInfoOriginalFileName =~ "CONHOST.EXE"
-        or Cmd has "conhost",
-    Headless = Cmd has "--headless",
-    HasUrl = Cmd matches regex @'[a-z][a-z0-9+.\-]*://'
-        or Cmd matches regex @'\\\\[a-z0-9_\-][^\\\s]*'
-        or Cmd matches regex @'[a-z0-9\-]+(\.[a-z0-9\-]+)*\.[a-z]{2,}/',
-    ImmFull = Cmd matches regex @'%[^%:]+%',
-    DelFull = Cmd matches regex @'![^!:]+!',
+    ImmFull       = Cmd matches regex @'%[^%:]+%',
+    DelFull       = Cmd matches regex @'![^!:]+!',
     SubstrExtract = Cmd matches regex @'[%!][^%!]+:~[^%!]*[%!]',
     SubstrReplace = Cmd matches regex @'[%!][^%!]+:[^~%!=]+=[^%!]*[%!]'
 | extend AnyExpansion = ImmFull or DelFull or SubstrExtract or SubstrReplace
-| where Conhost and Headless and HasUrl and AnyExpansion
+// Hidden launch detection
+| extend
+    ConhostHeadless = (FileName =~ "conhost.exe" or Cmd contains "conhost")
+        and Cmd contains "--headless",
+    StartMin  = Cmd matches regex @'\bstart\b[^&|]*\/min',
+    StartBack = Cmd matches regex @'\bstart\b[^&|]*\/b\b',
+    PsHidden  = Cmd matches regex @'-w(in(dowstyle)?)?\s+hidden'
+| extend HiddenLaunch = ConhostHeadless or StartMin or StartBack or PsHidden
+// Delayed expansion explicitly enabled
+| extend DelayedExpansionEnabled = Cmd contains "/v:on" or Cmd contains "/v on"
+// -------------------------------------------------------
+// BALANCED GATE:
+// Must have URL + Expansion + (HiddenLaunch OR /v:on)
+// -------------------------------------------------------
+| where HasUrl and AnyExpansion
+| where HiddenLaunch or DelayedExpansionEnabled
+// Label output
+| extend HiddenForms = strcat(
+    iff(ConhostHeadless, "conhost --headless;", ""),
+    iff(StartMin,        "start /min;", ""),
+    iff(StartBack,       "start /b;", ""),
+    iff(PsHidden,        "powershell -w hidden;", ""),
+    iff(not(HiddenLaunch), "none;", ""))
 | extend ExpansionForms = strcat(
-    iff(ImmFull, "Immediate(%var%);", ""), iff(DelFull, "Delayed(!var!);", ""),
-    iff(SubstrExtract, "SubstrExtract(:~);", ""), iff(SubstrReplace, "SubstrReplace(:=);", ""))
-| project Timestamp, ReportId, DeviceId, DeviceName, AccountName, FileName, ExpansionForms,
-          ProcessCommandLine, InitiatingProcessFileName, InitiatingProcessCommandLine
+    iff(ImmFull,       "Immediate(%var%);", ""),
+    iff(DelFull,       "Delayed(!var!);", ""),
+    iff(SubstrExtract, "SubstrExtract(:~);", ""),
+    iff(SubstrReplace, "SubstrReplace(:=);", ""))
+| project
+    Timestamp, DeviceName, AccountName,InitiatingProcessAccountUpn,ProcessCommandLine,
+    FileName, InitiatingProcessFileName,
+    HiddenLaunch, DelayedExpansionEnabled,
+    HiddenForms, ExpansionForms,
+    InitiatingProcessCommandLine
+| sort by Timestamp desc
