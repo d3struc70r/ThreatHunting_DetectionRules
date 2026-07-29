@@ -1,0 +1,53 @@
+//This KQL query looks into all the command line mentioned in https://clickfix.carsonww.com blog
+//Credit to Carson for collecting different types of command and putting into one place
+//This query is based on unique keywords found in the the command line from the blog
+
+let susp_terms = dynamic([
+   "amsiutils","amsiinitfailed",
+   "see_mask_nozonechecks","unblock-file","zone.identifier",
+   "runspacefactory","createpipeline","addscript",
+   "createdecryptor","transformfinalblock",
+   "scriptblock]::create",
+   "--headless",
+   "ipmo","exportedcommands",
+   "writealltext"
+]);
+let lure_terms = dynamic([
+   "verif","cloudflare","challenge","captcha","humanchallenge","not_a_robot","notarobot","i am not a robot"
+]);
+DeviceProcessEvents
+| where Timestamp > ago(300d)
+| where FileName in~ (
+   "powershell.exe","pwsh.exe","cmd.exe","conhost.exe","pcalua.exe",
+   "rundll32.exe","wscript.exe","mshta.exe","msiexec.exe"
+)
+| extend fullcmd = tolower(strcat(ProcessCommandLine, " ", InitiatingProcessCommandLine))
+| where
+   fullcmd has_any (susp_terms)
+   or fullcmd matches regex @"@ssl\\[0-9a-f\-]{30,40}"
+   or fullcmd matches regex @"\[-1\.\.-\d+\]\s*-join"
+   or fullcmd matches regex @"gcm\s+\*.*(voke-e|ke-ex)"
+   or fullcmd matches regex @"curl[^|]*\|\s*cmd"
+   or fullcmd matches regex @"rundll32\s+[a-z0-9_\-]+\.[a-z]{2,4},#?\d"
+   or (fullcmd has "net use" and fullcmd has "webdav")
+   or (FileName =~ "msiexec.exe" and fullcmd has "/i http" and fullcmd has_any (lure_terms))
+   or (fullcmd has_any ("frombase64string","invoke-expression"," iex ","iex(")
+       and fullcmd has_any ("irm ","iwr ","invoke-webrequest","-usebasicparsing","downloadstring","downloadfile")
+       and (fullcmd has_any (lure_terms) or fullcmd has "-bypass" or fullcmd has "hidden"))
+| where InitiatingProcessFileName  !has "devin.exe"
+| where InitiatingProcessFileName  !has "Windsurf.exe"
+| where InitiatingProcessFileName  !has "claude.exe"
+| where InitiatingProcessFileName  !has "code.exe"
+| where InitiatingProcessFileName  !has "cursor.exe"
+| where InitiatingProcessFileName  !has "codex.exe"
+| where InitiatingProcessFileName  !has "pycharm64.exe"
+| where InitiatingProcessFileName  !has "devin.exe"
+| where InitiatingProcessParentFileName  !has "Agent.Worker.exe"
+| where InitiatingProcessParentFileName  !has "platform_experience_helper.exe"
+| where InitiatingProcessParentFileName  !has "Agent.Listener.exe"
+| where InitiatingProcessParentFileName  !has "Postman.exe"
+| where ProcessCommandLine !has "width "
+| project Timestamp, DeviceId, DeviceName, AccountName, FileName,
+         InitiatingProcessFileName, InitiatingProcessParentFileName,
+         ProcessCommandLine, InitiatingProcessCommandLine, ReportId, SHA256
+| summarize arg_max(Timestamp, *) by DeviceId, ProcessCommandLine
