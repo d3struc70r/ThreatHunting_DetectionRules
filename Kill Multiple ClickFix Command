@@ -1,0 +1,154 @@
+// =====================================================================
+// ClickFix / FakeCAPTCHA / FileFix - paste-and-run hunting
+// Microsoft Defender XDR Advanced Hunting (KQL)
+// Design notes:
+//  - Weights are set so that any signal >= 6 is standalone-alertable.
+//  - Delivery-context signals (explorer parent, whitespace padding) are
+//    cheap to match but heavily weighted when combined.
+//  - Cheap has_any prefilter runs before the regex block to cut CPU.
+//  - Encoded-command / base64 detection intentionally omitted.
+//  - Single query block: do not insert blank lines, the editor splits on them.
+// =====================================================================
+let lookback = 100d;
+let threshold = 6;
+let shells = dynamic([
+    "powershell.exe","pwsh.exe","cmd.exe","conhost.exe","wt.exe",
+    "mshta.exe","wscript.exe","cscript.exe","msiexec.exe",
+    "rundll32.exe","regsvr32.exe","pcalua.exe","forfiles.exe",
+    "curl.exe","certutil.exe","bitsadmin.exe","ftp.exe"
+]);
+// Coarse prefilter - single tokens only, punctuation-bearing terms handled below.
+let prefilter = dynamic([
+    "iex","irm","iwr","icm","downloadstring","downloadfile","webclient",
+    "bitstransfer","amsiutils","amsiinitfailed","amsiscanbuffer",
+    "gcm","gal","ipmo","headless","captcha","recaptcha","verification",
+    "cloudflare","robot","cfchallenge","challengehash","confirmchallenge",
+    "clipboard","http","https","davwwwroot","urlcache","javascript",
+    "hidden","bypass","schtasks","certutil","bitsadmin"
+]);
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| where FileName in~ (shells)
+| extend cmd = tostring(ProcessCommandLine)
+| where isnotempty(cmd)
+| where cmd has_any (prefilter)
+    or cmd contains "invoke-"
+    or cmd contains "net use"
+    or cmd contains "clip.exe"
+    or InitiatingProcessFileName =~ "explorer.exe"
+| extend lcmd = tolower(cmd)
+// ---------- Delivery context ----------
+| extend RunDialogParent = iif(InitiatingProcessFileName =~ "explorer.exe", 1, 0)
+// Decoy comment appended to the pasted command ("I am not a robot", "Ray ID", etc.)
+| extend LureText = iif(
+      lcmd matches regex @"#\s*[^\r\n]{0,120}(verif|captcha|robot|ray\s?id|human|cloudflare|press\s+ok)"
+   or lcmd matches regex @"(recaptcha|cfchallenge|challengehash|confirmchallenge|not\s+a\s+robot|human\s+verification|verification\s+id|ray\s+id)", 1, 0)
+// Whitespace padding used to push the payload out of the visible Run field
+| extend WhitespacePad = iif(cmd matches regex @"[ \t]{25,}" and strlen(cmd) > 200, 1, 0)
+| extend LongLine = iif(strlen(cmd) > 500, 1, 0)
+// ---------- Execution / download stage ----------
+| extend Downloader = iif(
+      (lcmd has_any ("iex","icm") or lcmd contains "invoke-expression" or lcmd contains "invoke-command")
+      and (lcmd has_any ("irm","iwr","curl","wget","downloadstring","downloadfile")
+           or lcmd contains "invoke-restmethod"
+           or lcmd contains "invoke-webrequest"
+           or lcmd contains "net.webclient"
+           or lcmd contains "start-bitstransfer"), 1, 0)
+| extend ObfuscatedInvoke = iif(
+      lcmd matches regex @"gcm\s+\*[a-z\*\-]*(voke-e|ke-ex)"
+   or lcmd matches regex @"&\s*\(\s*(gal|get-alias|gcm|get-command)"
+   or lcmd matches regex @"\(\x22\{\d\}\{\d\}\x22\s*-f"
+   or lcmd matches regex @"\$env:comspec\[", 1, 0)
+| extend ReflectionLoader = iif(
+      (lcmd has "ipmo" or lcmd contains "import-module")
+      and (lcmd has_any ("exportedcommands","assembly","reflection") or lcmd contains "-passthru"), 1, 0)
+| extend ReverseString = iif(
+      lcmd contains "[-1.." and (lcmd contains "-join" or lcmd contains "tochararray"), 1, 0)
+| extend AmsiTamper = iif(
+      lcmd has_any ("amsiinitfailed","amsiutils","amsiscanbuffer")
+   or lcmd matches regex @"[\x22\x27]amsi[\x22\x27]?\s*\+", 1, 0)
+// ---------- LOLBin / transport ----------
+| extend ConhostHeadless = iif(lcmd contains "--headless", 1, 0)
+| extend MshtaRemote = iif(FileName =~ "mshta.exe"
+      and lcmd matches regex @"(https?://|javascript:|vbscript:|\\\\)", 1, 0)
+| extend MsiexecRemote = iif(FileName =~ "msiexec.exe" and lcmd contains "http", 1, 0)
+| extend SslWebDav = iif(
+      lcmd matches regex @"@ssl\\[0-9a-f\-]{36}"
+   or lcmd contains "davwwwroot"
+   or lcmd matches regex @"\\\\[^\s\\]+@(ssl|80|443|8080)\\", 1, 0)
+| extend NetUseRemote = iif(lcmd contains "net use"
+      and lcmd matches regex @"\\\\[^\s\\]+@(ssl|\d{2,5})\\", 1, 0)
+| extend PcaluaProxy = iif(FileName =~ "pcalua.exe"
+      and lcmd matches regex @"-a\s+(\\\\|https?://|[a-z]:\\)", 1, 0)
+| extend PipeToShell = iif(
+      lcmd matches regex @"(curl|wget|irm|iwr)[^|]{0,200}\|\s*(cmd|powershell|pwsh|iex|invoke-expression)", 1, 0)
+| extend LolbinFetch = iif(lcmd has_any ("certutil","bitsadmin")
+      and (lcmd contains "urlcache" or lcmd contains "transfer" or lcmd contains "http"), 1, 0)
+// ---------- Supporting behaviour ----------
+| extend HiddenExec = iif(
+      lcmd contains "-w hidden"
+   or lcmd contains "-windowstyle hidden"
+   or lcmd contains "-nop"
+   or lcmd contains "-noprofile"
+   or lcmd contains "-ep bypass"
+   or lcmd contains "-executionpolicy bypass", 1, 0)
+| extend Clipboard = iif(lcmd contains "get-clipboard" or lcmd contains "clip.exe", 1, 0)
+| extend Persistence = iif(
+      (lcmd has "schtasks" or lcmd contains "reg add" or lcmd contains "new-scheduledtask")
+      and (lcmd contains "/create" or lcmd contains "currentversion\\run" or lcmd contains "-action"), 1, 0)
+// ---------- Score ----------
+| extend Score =
+      LureText*6            // standalone: the lure comment is near-conclusive
+    + AmsiTamper*6
+    + SslWebDav*6
+    + Downloader*6          // standalone: iex(irm ...) is the core ClickFix payload
+    + ObfuscatedInvoke*6
+    + WhitespacePad*5
+    + ConhostHeadless*5
+    + MshtaRemote*5
+    + MsiexecRemote*5
+    + PipeToShell*5
+    + ReflectionLoader*5
+    + NetUseRemote*4
+    + PcaluaProxy*4
+    + LolbinFetch*4
+    + ReverseString*3
+    + Clipboard*3
+    + RunDialogParent*3     // context only - never fires alone
+    + Persistence*2
+    + HiddenExec*2
+    + LongLine*1
+| where Score >= threshold
+// ---------- Triage aid: which rules fired ----------
+| extend Signals = trim_end(",", strcat(
+      iif(LureText==1,         "LureText,",         ""),
+      iif(WhitespacePad==1,    "WhitespacePad,",    ""),
+      iif(RunDialogParent==1,  "RunDialogParent,",  ""),
+      iif(Downloader==1,       "Downloader,",       ""),
+      iif(ObfuscatedInvoke==1, "ObfuscatedInvoke,", ""),
+      iif(ReflectionLoader==1, "ReflectionLoader,", ""),
+      iif(ReverseString==1,    "ReverseString,",    ""),
+      iif(AmsiTamper==1,       "AmsiTamper,",       ""),
+      iif(ConhostHeadless==1,  "ConhostHeadless,",  ""),
+      iif(MshtaRemote==1,      "MshtaRemote,",      ""),
+      iif(MsiexecRemote==1,    "MsiexecRemote,",    ""),
+      iif(SslWebDav==1,        "SslWebDav,",        ""),
+      iif(NetUseRemote==1,     "NetUseRemote,",     ""),
+      iif(PcaluaProxy==1,      "PcaluaProxy,",      ""),
+      iif(PipeToShell==1,      "PipeToShell,",      ""),
+      iif(LolbinFetch==1,      "LolbinFetch,",      ""),
+      iif(HiddenExec==1,       "HiddenExec,",       ""),
+      iif(Clipboard==1,        "Clipboard,",        ""),
+      iif(Persistence==1,      "Persistence,",      "")))
+| where ProcessCommandLine !has "https://astral.sh"
+| where InitiatingProcessFileName !has "claude.exe"
+| where InitiatingProcessFileName !has "codex.exe"
+| where ProcessCommandLine !has "bun.sh"
+| where ProcessCommandLine !has "https://chatgpt.com"
+| project
+    Timestamp, Score, Signals,
+    DeviceId, DeviceName, AccountName, AccountDomain,
+    FileName, FolderPath, ProcessId, ProcessCommandLine,
+    InitiatingProcessFileName, InitiatingProcessId, InitiatingProcessCommandLine,
+    InitiatingProcessParentFileName, SHA1, ReportId
+| order by Score desc, Timestamp desc
